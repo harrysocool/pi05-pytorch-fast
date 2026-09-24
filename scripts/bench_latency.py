@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
-os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:512")
+os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "max_split_size_mb:512")
 os.environ.setdefault("TORCH_BLAS_PREFER_HIPBLASLT", "1")
 
 PKG_ROOT = Path(__file__).resolve().parents[1]

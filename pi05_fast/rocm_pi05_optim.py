@@ -23,7 +23,7 @@ _FROM_PRETRAINED_PATCHED = False
 def apply_rocm_env() -> None:
     """Call before importing torch."""
     os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
-    os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:512")
+    os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "max_split_size_mb:512")
     os.environ.setdefault("TORCH_BLAS_PREFER_HIPBLASLT", "1")
 
 
@@ -213,6 +213,8 @@ def apply_rocm_pi05_optimizations(policy: Any, *, compile_model: bool | None = N
     if torch.cuda.is_available():
         policy.to("cuda")
         model.to(torch.bfloat16)
+        if hasattr(policy.config, "device"):
+            policy.config.device = "cuda"
 
     model.embed_prefix = types.MethodType(_batched_embed_prefix, model)
     if _use_embedl_empty_cam_pool(model):
@@ -345,32 +347,42 @@ def install_rocm_pi05_eval_hooks() -> None:
     orig = PI05Policy.from_pretrained.__func__
 
     @classmethod
-    def wrapped(cls, *args, **kwargs):
+    def wrapped(
+        cls,
+        pretrained_name_or_path,
+        *,
+        config=None,
+        force_download=False,
+        resume_download=None,
+        proxies=None,
+        token=None,
+        cache_dir=None,
+        local_files_only=False,
+        revision=None,
+        strict=True,
+        **kwargs,
+    ):
         # PI05Policy.__init__ does model.to(config.device) with device=None → cuda.
         # from_pretrained then load_file's a host state dict and load_state_dict
         # copies it onto those params. On gfx1151 UMA that is two ~16 GB copies
         # in the same DRAM; copy_ runs GPU-idle for many minutes (or swap-thrashes).
         # Build on CPU; apply_rocm_pi05_optimizations then .to("cuda") + bf16.
-        config = kwargs.get("config")
         if config is None:
             from lerobot.configs.policies import PreTrainedConfig
 
-            path = args[0] if args else kwargs.get("pretrained_name_or_path")
-            cfg_kw = {
-                k: kwargs[k]
-                for k in (
-                    "force_download",
-                    "resume_download",
-                    "proxies",
-                    "token",
-                    "cache_dir",
-                    "local_files_only",
-                    "revision",
-                )
-                if k in kwargs
-            }
-            config = PreTrainedConfig.from_pretrained(path, **cfg_kw)
-            kwargs["config"] = config
+            # Match LeRobot's original config construction, including policy
+            # overrides supplied through **kwargs. Only the device is changed.
+            config = PreTrainedConfig.from_pretrained(
+                pretrained_name_or_path=pretrained_name_or_path,
+                force_download=force_download,
+                resume_download=resume_download,
+                proxies=proxies,
+                token=token,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+                revision=revision,
+                **kwargs,
+            )
         prev = getattr(config, "device", None)
         if hasattr(config, "device") and prev != "cpu":
             config.device = "cpu"
@@ -379,7 +391,22 @@ def install_rocm_pi05_eval_hooks() -> None:
                 "(Strix Halo UMA)",
                 flush=True,
             )
-        policy = orig(cls, *args, **kwargs)
+        policy = orig(
+            cls,
+            pretrained_name_or_path,
+            config=config,
+            force_download=force_download,
+            resume_download=resume_download,
+            proxies=proxies,
+            token=token,
+            cache_dir=cache_dir,
+            local_files_only=local_files_only,
+            revision=revision,
+            strict=strict,
+            **kwargs,
+        )
+        if hasattr(config, "device"):
+            config.device = prev
         return apply_rocm_pi05_optimizations(policy)
 
     PI05Policy.from_pretrained = wrapped

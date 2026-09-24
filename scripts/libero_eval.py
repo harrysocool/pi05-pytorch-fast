@@ -18,7 +18,7 @@ os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("MUJOCO_EGL_DEVICE_ID", "0")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
-os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:512")
+os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "max_split_size_mb:512")
 os.environ.setdefault("TORCH_BLAS_PREFER_HIPBLASLT", "1")
 
 PKG_ROOT = Path(__file__).resolve().parents[1]

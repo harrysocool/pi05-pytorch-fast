@@ -56,7 +56,7 @@ write_env_snippet() {
     echo "export PI05_FAST_ROOT=\"${PKG_ROOT}\""
     echo "export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=\"\${TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL:-1}\""
     echo "export TORCH_BLAS_PREFER_HIPBLASLT=\"\${TORCH_BLAS_PREFER_HIPBLASLT:-1}\""
-    echo "export PYTORCH_HIP_ALLOC_CONF=\"\${PYTORCH_HIP_ALLOC_CONF:-expandable_segments:True,max_split_size_mb:512}\""
+    echo "export PYTORCH_HIP_ALLOC_CONF=\"\${PYTORCH_HIP_ALLOC_CONF:-max_split_size_mb:512}\""
     echo "export PI05_COMPILE=\"\${PI05_COMPILE:-1}\""
     echo "export PI05_COMPILE_MODE=\"\${PI05_COMPILE_MODE:-max-autotune-no-cudagraphs}\""
     echo "export PI05_PREFIX_LM_FP16=\"\${PI05_PREFIX_LM_FP16:-1}\""
