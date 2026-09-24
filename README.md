@@ -1,13 +1,13 @@
-# Fastest gfx1151 PyTorch recipe for OpenPI π0.5 SnapFlow (1-NFE)
+# Fast gfx1151 PyTorch recipe for OpenPI π0.5 SnapFlow (1-NFE)
 
-## Measured results (2026-09-02)
+## Measured results (2026-09-24)
 
 Machine: AMD Ryzen AI Max+ / Radeon 8060S (`gfx1151`).
 
 | Metric | Value |
 |--------|--------|
-| E2E action chunk latency | **104 ms** default, **81 ms** with `PI05_LANG_TOKENS=64 PI05_CACHE_EMPTY_CAM=1` (median; `scripts/bench_latency.py`, 1-NFE `sample_actions`) |
-| LIBERO-10 accuracy | **20/20 = 100%** (2 episodes × 10 tasks, seed 0); unchanged with the knobs above (39/40 over seeds 0+1 either way) |
+| E2E action chunk latency | **96.00 ms** default, **79.88 ms** with `PI05_LANG_TOKENS=64 PI05_CACHE_EMPTY_CAM=1` (100-run median; `scripts/bench_latency.py`) |
+| LIBERO-10 accuracy | **20/20 = 100%** on the default maintained path (2 episodes × 10 tasks, seed 0) |
 | `n_action_steps` / `num_inference_steps` | 10 / 1 |
 | Prefix tokens | 776 (batched SigLIP + empty-camera pool 256→64); **640** with `PI05_LANG_TOKENS=64` |
 
@@ -34,10 +34,11 @@ Closed-loop **LeRobot PI05Policy** inference:
 2. **W4A4** packed INT4 GEMM on the **PaliGemma prefix LM only** (HIP custom op)
 3. Prefix LM weights/activations in **fp16** (match W4A4; SigLIP stays bf16)
 4. Shared activation quant for QKV and gate/up (`int4_gemm3` / `int4_gemm2`)
-5. Batched SigLIP (3 cameras in one forward); empty-camera pool **256→64** → prefix **776**
-6. **`torch.compile(max-autotune-no-cudagraphs, fullgraph=True)`** + gfx1151 L2 antialias
-7. LM / expert attention **eager** (Inductor); SigLIP **SDPA**
-8. `n_action_steps=10`, `num_inference_steps=1`
+5. WMMA-fragment-major gate/up weights for coalesced static-weight loads
+6. Batched SigLIP (3 cameras in one forward); empty-camera pool **256→64** → prefix **776**
+7. **`torch.compile(max-autotune-no-cudagraphs, fullgraph=True)`** + gfx1151 L2 antialias
+8. LM / expert attention **eager** (Inductor); SigLIP **SDPA**
+9. `n_action_steps=10`, `num_inference_steps=1`
 
 **pure PyTorch** path we have on this GPU.
 
@@ -83,6 +84,19 @@ python scripts/pack_w4a4_prefix.py \
 
 `env.sh` sets `PI05_W4A4_PACK` to `models/w4a4_prefix`. First inference JIT-compiles
 `pi05_fast/w4a4/csrc/int4_gemm.cu` (needs `ninja` + ROCm devel, already in setup).
+PyTorch hipifies that source during the build; the generated `int4_gemm.hip` is
+not source-controlled.
+
+## W4A4 correctness smoke
+
+```bash
+source env.sh
+python tests/test_w4a4.py -v
+```
+
+The CPU test verifies the preshuffled payload and scale layout. On ROCm, the GPU
+tests also compare original versus padded weight rows, compare row-major versus
+preshuffled gate weights, and reject a row-major tensor passed to the tiled op.
 
 ## LIBERO eval (accuracy)
 
@@ -96,7 +110,7 @@ python scripts/libero_eval.py \
   --n-inference-steps 1 --n-action-steps 10 \
   --output-dir eval_out/libero10_ep2
 
-# same command with prefix trimming (also 20/20)
+# optional prefix trimming; evaluate separately for the target task set
 PI05_LANG_TOKENS=64 python scripts/libero_eval.py ... --output-dir eval_out/libero10_lang64
 ```
 
@@ -113,14 +127,14 @@ When using `PI05_LANG_TOKENS`, check the log says `lang tokens trimmed to 64` an
 ```bash
 source env.sh
 
-python scripts/bench_latency.py                        # 104 ms
-PI05_LANG_TOKENS=64 python scripts/bench_latency.py    #  89 ms
+python scripts/bench_latency.py                        # 96 ms
+PI05_LANG_TOKENS=64 python scripts/bench_latency.py    # task-dependent intermediate
 PI05_LANG_TOKENS=64 PI05_CACHE_EMPTY_CAM=1 \
-    python scripts/bench_latency.py                    #  81 ms
+    python scripts/bench_latency.py                    # 80 ms
 ```
 
 First call pays `torch.compile` autotune (minutes). Median after warmup is the number
-to compare (**104 ms** on 8060S, **81 ms** with both knobs).
+to compare (**96.00 ms** on 8060S, **79.88 ms** with both knobs).
 
 The synthetic prompt fills 52 of the 200 padded language tokens, matching LIBERO-10
 (`PI05_BENCH_LANG_LEN` overrides it).
@@ -142,12 +156,14 @@ pi05-pytorch-fast/
 │   ├── rocm_antialias.py
 │   ├── snapflow_pi05.py
 │   └── w4a4/               
-└── scripts/
+├── scripts/
     ├── setup.sh
     ├── download_checkpoints.sh
     ├── pack_w4a4_prefix.py
     ├── libero_eval.py
     └── bench_latency.py
+└── tests/
+    └── test_w4a4.py
 ```
 
 ## Environment knobs
@@ -159,6 +175,9 @@ pi05-pytorch-fast/
 | `PI05_COMPILE_MODE` | `max-autotune-no-cudagraphs` | Inductor mode |
 | `PI05_PREFIX_LM_FP16` | `1` | Cast prefix LM to fp16 after W4A4 |
 | `PI05_W4A4_FUSE_QUANT` | `1` | Shared QKV / gate-up quant |
+| `PI05_W4A4_ROW_PAD_WORDS` | `8` | Runtime-pad each packed weight row to a 32-byte-aligned, off-period stride. Set `1` for the original `K/8+1` layout |
+| `PI05_W4A4_GATE_PRESHUFFLE` | `1` | Reorder the static 2048→16384 gate/up weights once at load time into WMMA-fragment-major order. Set `0` for the row-major fallback |
+| `PYTORCH_HIP_ALLOC_CONF` | `max_split_size_mb:512` | Stable allocator setting on this gfx1151 APU. `expandable_segments:True` can hang the first allocation with the pinned nightly stack |
 | `PI05_INDUCTOR_GEMM_BACKENDS` | `ATEN` | Inductor GEMM backend. ROCm 10.1 disables the origami heuristic, so Inductor mis-ranks triton over hipBLASLt; `ATEN` is ~2% faster. Set empty to restore triton autotune |
 | `PI05_LANG_TOKENS` | unset (off) | Trim trailing **padded** language tokens to this bucket (prefix = 576 + N). Real tokens are never dropped: if the prompt does not fit, the full 200 are used and a warning is printed. `64` → prefix 640 = exactly 5 `gemm_iu4` `BM=128` tiles (−14% E2E, LIBERO-10 still 20/20) |
 | `PI05_CACHE_EMPTY_CAM` | `0` (off) | Cache the empty-camera SigLIP embedding. With `empty_cameras=1` the placeholder camera is a constant `-1` image, so its embedding never changes, yet a full vision forward runs on it every frame. Caching it batches only the real cameras (−7 ms). Not bit-exact: bf16 SigLIP output depends on batch size (rel err ~4e-3) |
@@ -173,6 +192,10 @@ pi05-pytorch-fast/
 - Quantizing SigLIP 4-bit (MLP `K=4304` not multiple of 64; attn projections cost ~1 LIBERO
   episode for only −1.7% latency)
 - W4A4 on the action expert (at `M=50` the INT4 path is *slower* than bf16 hipBLASLt)
+- Fusing GELU × gate/up into down-projection quantization (slower and not bit-exact)
+- XOR-swizzled LDS and later vector/tail specializations whose sub-millisecond gains did
+  not justify the extra shape-specific production code
+- ROCm expandable allocator segments with the pinned nightly stack (first allocation can hang)
 - ONNX / MIGraphX / ORT (parent `pi05-migraphx` package)
 
 ## License / provenance
