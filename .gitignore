@@ -6,3 +6,6 @@ __pycache__/
 *.pyc
 .venv/
 .cache/
+.rocprofv3/
+results/
+pi05_fast/w4a4/csrc/*.hip

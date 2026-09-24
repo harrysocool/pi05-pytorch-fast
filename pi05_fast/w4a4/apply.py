@@ -48,19 +48,32 @@ def replace_linears_from_packed(
     meta_layers: dict[str, dict],
     device: torch.device | None = None,
 ) -> int:
+    row_pad_words = max(1, int(os.environ.get("PI05_W4A4_ROW_PAD_WORDS", "8")))
     n = 0
     for name, spec in meta_layers.items():
         key = f"{name}.packed"
         if key not in packed:
             continue
         w = packed[key]
+        logical_words = int(spec["in_features"]) // 8
+        if row_pad_words > 1 and w.shape[1] == logical_words + 1:
+            w = torch.nn.functional.pad(w, (0, row_pad_words - 1))
         if device is not None:
             w = w.to(device)
         bias = packed.get(f"{name}.bias")
         if bias is not None and device is not None:
             bias = bias.to(device)
         rotate = spec.get("rotate")
-        _set_module(model, name, W4A4Linear(w, bias=bias, rotate=rotate))
+        _set_module(
+            model,
+            name,
+            W4A4Linear(
+                w,
+                bias=bias,
+                rotate=rotate,
+                in_features=int(spec["in_features"]),
+            ),
+        )
         n += 1
     return n
 
@@ -81,9 +94,11 @@ def apply_w4a4_from_dir(model: nn.Module, pack_dir: str | Path) -> int:
     preload()
     n = replace_linears_from_packed(model, packed, meta["layers"], device=device)
     n_fuse = fuse_shared_activation_quant(model)
+    row_pad_words = max(1, int(os.environ.get("PI05_W4A4_ROW_PAD_WORDS", "8")))
     print(
         f"w4a4: replaced {n} Linear modules from {pack_dir}; "
-        f"shared-quant fused {n_fuse} QKV/MLP groups",
+        f"shared-quant fused {n_fuse} QKV/MLP groups; "
+        f"row stride pad {row_pad_words} word(s)",
         flush=True,
     )
     return n

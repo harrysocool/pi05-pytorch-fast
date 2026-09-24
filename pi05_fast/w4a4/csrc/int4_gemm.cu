@@ -8,58 +8,99 @@
 typedef int int2v __attribute__((ext_vector_type(2)));
 typedef int int8v __attribute__((ext_vector_type(8)));
 
+#ifndef BM
 #define BM 128
+#endif
+#ifndef BN
 #define BN 128
+#endif
+#ifndef BK
 #define BK 64
-#define TPB 256
+#endif
+#ifndef DOWN_BK
+#define DOWN_BK 128
+#endif
+#ifndef GATE_SPECIAL
+#define GATE_SPECIAL 1
+#endif
+#ifndef GEMM_TPB
+#define GEMM_TPB 256
+#endif
+#ifndef MI
 #define MI 2
+#endif
+#ifndef NI
 #define NI 4
-#define KPW (BK / 8)
-#define LDAi (KPW + 1)
-#define NLA ((BM * KPW) / TPB)
-#define NLB ((BN * KPW) / TPB)
+#endif
+#define QUANT_TPB 256
+#define NWAVE_N (BN / (NI * 16))
 
-__global__ void gemm_iu4(const int* A, const int* B, _Float16* Cf, const float* sa, int M, int N, int K) {
-  int ROW = K / 8 + 1;
-  __shared__ int As[2][BM * LDAi];
-  __shared__ int Bs[2][BN * LDAi];
+static_assert(BM % (MI * 16) == 0, "BM must be divisible by the per-wave M tile");
+static_assert(BN % (NI * 16) == 0, "BN must be divisible by the per-wave N tile");
+static_assert(
+    (BM / (MI * 16)) * NWAVE_N == GEMM_TPB / 32,
+    "GEMM_TPB does not match the BM/BN wave layout");
+
+// Register-prefetched single-LDS mode keeps global loads overlapped with WMMA,
+// but reuses the same LDS tile after the post-compute barrier. This cuts LDS
+// residency without changing accumulation order.
+template <int TILE_K, bool SINGLE_BUFFER = false>
+__global__ void gemm_iu4(
+    const int* A,
+    const int* B,
+    _Float16* Cf,
+    const float* sa,
+    int M,
+    int N,
+    int K,
+    int ROW) {
+  constexpr int KPW = TILE_K / 8;
+  constexpr int LDAi = KPW + 1;
+  constexpr int NLA = (BM * KPW) / GEMM_TPB;
+  constexpr int NLB = (BN * KPW) / GEMM_TPB;
+  static_assert(TILE_K % 16 == 0, "TILE_K must be a multiple of WMMA K");
+  static_assert((BM * KPW) % GEMM_TPB == 0, "A cooperative load must divide evenly");
+  static_assert((BN * KPW) % GEMM_TPB == 0, "B cooperative load must divide evenly");
+  __shared__ int As[SINGLE_BUFFER ? 1 : 2][BM * LDAi];
+  __shared__ int Bs[SINGLE_BUFFER ? 1 : 2][BN * LDAi];
   int bm = blockIdx.y * BM, bn = blockIdx.x * BN, tid = threadIdx.x;
-  int wid = tid / 32, lid = tid % 32, lane = lid % 16, wm = wid / 2, wn = wid % 2;
+  int wid = tid / 32, lid = tid % 32, lane = lid % 16;
+  int wm = wid / NWAVE_N, wn = wid % NWAVE_N;
   int8v c[MI][NI];
   for (int i = 0; i < MI; i++)
     for (int j = 0; j < NI; j++) c[i][j] = int8v{};
   for (int i = 0; i < NLA; i++) {
-    int x = tid + i * TPB;
+    int x = tid + i * GEMM_TPB;
     int r = x / KPW, kk = x % KPW;
     int gr = bm + r;
     As[0][r * LDAi + kk] = (gr < M) ? A[gr * (K / 8) + kk] : 0;
   }
   for (int i = 0; i < NLB; i++) {
-    int x = tid + i * TPB;
+    int x = tid + i * GEMM_TPB;
     int co = x / KPW, kk = x % KPW;
     int gc = bn + co;
     Bs[0][co * LDAi + kk] = (gc < N) ? B[gc * ROW + kk] : 0;
   }
   __syncthreads();
   int buf = 0;
-  for (int k0 = 0; k0 < K; k0 += BK) {
-    int nk = k0 + BK;
+  for (int k0 = 0; k0 < K; k0 += TILE_K) {
+    int nk = k0 + TILE_K;
     int ra[NLA], rb[NLB];
     if (nk < K) {
       for (int i = 0; i < NLA; i++) {
-        int x = tid + i * TPB;
+        int x = tid + i * GEMM_TPB;
         int r = x / KPW, kk = x % KPW;
         int gr = bm + r;
         ra[i] = (gr < M) ? A[gr * (K / 8) + (nk / 8 + kk)] : 0;
       }
       for (int i = 0; i < NLB; i++) {
-        int x = tid + i * TPB;
+        int x = tid + i * GEMM_TPB;
         int co = x / KPW, kk = x % KPW;
         int gc = bn + co;
         rb[i] = (gc < N) ? B[gc * ROW + (nk / 8 + kk)] : 0;
       }
     }
-    for (int ks = 0; ks < BK; ks += 16)
+    for (int ks = 0; ks < TILE_K; ks += 16)
       for (int mi = 0; mi < MI; mi++)
         for (int ni = 0; ni < NI; ni++) {
           int r0 = wm * 32 + mi * 16, c0 = wn * 64 + ni * 16;
@@ -72,17 +113,142 @@ __global__ void gemm_iu4(const int* A, const int* B, _Float16* Cf, const float* 
         }
     __syncthreads();
     if (nk < K) {
+      int next_buf = SINGLE_BUFFER ? 0 : (buf ^ 1);
       for (int i = 0; i < NLA; i++)
-        As[buf ^ 1][(tid + i * TPB) / KPW * LDAi + (tid + i * TPB) % KPW] = ra[i];
+        As[next_buf][(tid + i * GEMM_TPB) / KPW * LDAi + (tid + i * GEMM_TPB) % KPW] = ra[i];
       for (int i = 0; i < NLB; i++)
-        Bs[buf ^ 1][(tid + i * TPB) / KPW * LDAi + (tid + i * TPB) % KPW] = rb[i];
+        Bs[next_buf][(tid + i * GEMM_TPB) / KPW * LDAi + (tid + i * GEMM_TPB) % KPW] = rb[i];
       __syncthreads();
     }
-    buf ^= 1;
+    if constexpr (!SINGLE_BUFFER) {
+      buf ^= 1;
+    }
   }
   for (int mi = 0; mi < MI; mi++)
     for (int ni = 0; ni < NI; ni++) {
       int r0 = wm * 32 + mi * 16, c0 = wn * 64 + ni * 16;
+      int col = bn + c0 + lane;
+      if (col >= N) continue;
+      float scw = __int_as_float(B[col * ROW + (K / 8)]);
+      for (int e = 0; e < 8; e++) {
+        int r = 2 * e + lid / 16;
+        int gr = bm + r0 + r;
+        if (gr < M) Cf[gr * N + col] = (_Float16)((float)c[mi][ni][e] * sa[gr] * scw);
+      }
+    }
+}
+
+// Shape-specialized companion used only by the M=776 gate/up projections.
+template <int TILE_M, int TILE_N, int TILE_K, int THREADS, int M_ITERS, int N_ITERS, bool SINGLE_BUFFER = false>
+__global__ void gemm_iu4_shape(
+    const int* A,
+    const int* B,
+    _Float16* Cf,
+    const float* sa,
+    int M,
+    int N,
+    int K,
+    int ROW) {
+  constexpr int KPW = TILE_K / 8;
+  constexpr int LDAi = KPW + 1;
+  constexpr int A_WORDS = TILE_M * KPW;
+  constexpr int B_WORDS = TILE_N * KPW;
+  constexpr int NLA = (A_WORDS + THREADS - 1) / THREADS;
+  constexpr int NLB = (B_WORDS + THREADS - 1) / THREADS;
+  constexpr int N_WAVES = TILE_N / (N_ITERS * 16);
+  static_assert(TILE_K % 16 == 0, "TILE_K must be a multiple of WMMA K");
+  static_assert(TILE_M % (M_ITERS * 16) == 0, "invalid M wave tile");
+  static_assert(TILE_N % (N_ITERS * 16) == 0, "invalid N wave tile");
+  static_assert(
+      (TILE_M / (M_ITERS * 16)) * N_WAVES == THREADS / 32,
+      "thread count does not match the wave layout");
+
+  __shared__ int As[SINGLE_BUFFER ? 1 : 2][TILE_M * LDAi];
+  __shared__ int Bs[SINGLE_BUFFER ? 1 : 2][TILE_N * LDAi];
+  int bm = blockIdx.y * TILE_M, bn = blockIdx.x * TILE_N, tid = threadIdx.x;
+  int wid = tid / 32, lid = tid % 32, lane = lid % 16;
+  int wm = wid / N_WAVES, wn = wid % N_WAVES;
+  int8v c[M_ITERS][N_ITERS];
+  for (int i = 0; i < M_ITERS; i++)
+    for (int j = 0; j < N_ITERS; j++) c[i][j] = int8v{};
+
+  for (int i = 0; i < NLA; i++) {
+    int x = tid + i * THREADS;
+    if (x >= A_WORDS) continue;
+    int r = x / KPW, kk = x % KPW;
+    int gr = bm + r;
+    As[0][r * LDAi + kk] = (gr < M) ? A[gr * (K / 8) + kk] : 0;
+  }
+  for (int i = 0; i < NLB; i++) {
+    int x = tid + i * THREADS;
+    if (x >= B_WORDS) continue;
+    int co = x / KPW, kk = x % KPW;
+    int gc = bn + co;
+    Bs[0][co * LDAi + kk] = (gc < N) ? B[gc * ROW + kk] : 0;
+  }
+  __syncthreads();
+
+  int buf = 0;
+  for (int k0 = 0; k0 < K; k0 += TILE_K) {
+    int nk = k0 + TILE_K;
+    int ra[NLA], rb[NLB];
+    if (nk < K) {
+      for (int i = 0; i < NLA; i++) {
+        int x = tid + i * THREADS;
+        if (x >= A_WORDS) {
+          ra[i] = 0;
+          continue;
+        }
+        int r = x / KPW, kk = x % KPW;
+        int gr = bm + r;
+        ra[i] = (gr < M) ? A[gr * (K / 8) + (nk / 8 + kk)] : 0;
+      }
+      for (int i = 0; i < NLB; i++) {
+        int x = tid + i * THREADS;
+        if (x >= B_WORDS) {
+          rb[i] = 0;
+          continue;
+        }
+        int co = x / KPW, kk = x % KPW;
+        int gc = bn + co;
+        rb[i] = (gc < N) ? B[gc * ROW + (nk / 8 + kk)] : 0;
+      }
+    }
+    for (int ks = 0; ks < TILE_K; ks += 16)
+      for (int mi = 0; mi < M_ITERS; mi++)
+        for (int ni = 0; ni < N_ITERS; ni++) {
+          int r0 = wm * (M_ITERS * 16) + mi * 16;
+          int c0 = wn * (N_ITERS * 16) + ni * 16;
+          int2v af, bf;
+          af[0] = As[buf][(r0 + lane) * LDAi + ks / 8];
+          af[1] = As[buf][(r0 + lane) * LDAi + ks / 8 + 1];
+          bf[0] = Bs[buf][(c0 + lane) * LDAi + ks / 8];
+          bf[1] = Bs[buf][(c0 + lane) * LDAi + ks / 8 + 1];
+          c[mi][ni] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(
+              true, af, true, bf, c[mi][ni], false);
+        }
+    __syncthreads();
+    if (nk < K) {
+      int next_buf = SINGLE_BUFFER ? 0 : (buf ^ 1);
+      for (int i = 0; i < NLA; i++) {
+        int x = tid + i * THREADS;
+        if (x < A_WORDS) As[next_buf][x / KPW * LDAi + x % KPW] = ra[i];
+      }
+      for (int i = 0; i < NLB; i++) {
+        int x = tid + i * THREADS;
+        if (x < B_WORDS) Bs[next_buf][x / KPW * LDAi + x % KPW] = rb[i];
+      }
+      __syncthreads();
+    }
+    if constexpr (!SINGLE_BUFFER) {
+      buf ^= 1;
+    }
+  }
+
+  for (int mi = 0; mi < M_ITERS; mi++)
+    for (int ni = 0; ni < N_ITERS; ni++) {
+      int r0 = wm * (M_ITERS * 16) + mi * 16;
+      int c0 = wn * (N_ITERS * 16) + ni * 16;
       int col = bn + c0 + lane;
       if (col >= N) continue;
       float scw = __int_as_float(B[col * ROW + (K / 8)]);
@@ -100,7 +266,7 @@ __global__ void quant_rot_rb(const _Float16* X, int* Q, float* sc, int M, long R
   if (row >= M) return;
   int tid = threadIdx.x;
   __shared__ _Float16 lds[K];
-  __shared__ float red[TPB];
+  __shared__ float red[QUANT_TPB];
   float reg[R];
 #pragma unroll
   for (int j = 0; j < R; j++) reg[j] = (float)X[row * RS + tid * R + j];
@@ -116,7 +282,7 @@ __global__ void quant_rot_rb(const _Float16* X, int* Q, float* sc, int M, long R
   for (int j = 0; j < R; j++) lds[tid * R + j] = (_Float16)reg[j];
   __syncthreads();
   for (int len = R; len < K; len <<= 1) {
-    for (int idx = tid; idx < K / 2; idx += TPB) {
+    for (int idx = tid; idx < K / 2; idx += QUANT_TPB) {
       int group = idx / len, off = idx % len;
       int p = group * 2 * len + off;
       float a = (float)lds[p], b = (float)lds[p + len];
@@ -126,19 +292,19 @@ __global__ void quant_rot_rb(const _Float16* X, int* Q, float* sc, int M, long R
     __syncthreads();
   }
   float m = 0;
-  for (int k = tid; k < K; k += TPB) {
+  for (int k = tid; k < K; k += QUANT_TPB) {
     float v = fabsf((float)lds[k]);
     m = fmaxf(m, v);
   }
   red[tid] = m;
   __syncthreads();
-  for (int s = TPB / 2; s; s >>= 1) {
+  for (int s = QUANT_TPB / 2; s; s >>= 1) {
     if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
     __syncthreads();
   }
   float sdiv = red[0] / 7.f + 1e-12f;
   if (tid == 0) sc[row] = sdiv * rsqrtf((float)K);
-  for (int p = tid; p < K / 8; p += TPB) {
+  for (int p = tid; p < K / 8; p += QUANT_TPB) {
     int pk = 0;
     for (int j = 0; j < 8; j++) {
       int q = (int)lrintf((float)lds[p * 8 + j] / sdiv);
@@ -152,21 +318,21 @@ __global__ void quant_rot_rb(const _Float16* X, int* Q, float* sc, int M, long R
 __global__ void quant_rows(const _Float16* X, int* Q, float* sc, int M, int K) {
   int row = blockIdx.x;
   if (row >= M) return;
-  __shared__ float sm[TPB];
+  __shared__ float sm[QUANT_TPB];
   float m = 0;
-  for (int k = threadIdx.x; k < K; k += TPB) {
+  for (int k = threadIdx.x; k < K; k += QUANT_TPB) {
     float v = fabsf((float)X[row * K + k]);
     m = fmaxf(m, v);
   }
   sm[threadIdx.x] = m;
   __syncthreads();
-  for (int s = TPB / 2; s; s >>= 1) {
+  for (int s = QUANT_TPB / 2; s; s >>= 1) {
     if (threadIdx.x < s) sm[threadIdx.x] = fmaxf(sm[threadIdx.x], sm[threadIdx.x + s]);
     __syncthreads();
   }
   float s0 = sm[0] / 7.f + 1e-12f;
   if (threadIdx.x == 0) sc[row] = s0;
-  for (int p = threadIdx.x; p < K / 8; p += TPB) {
+  for (int p = threadIdx.x; p < K / 8; p += QUANT_TPB) {
     int pk = 0;
     for (int j = 0; j < 8; j++) {
       int q = (int)lrintf((float)X[row * K + p * 8 + j] / s0);
@@ -188,7 +354,10 @@ struct QuantizedX {
 static void check_packed(const torch::Tensor& w, int K, const char* name) {
   TORCH_CHECK(w.is_cuda(), name, " must be on CUDA/HIP");
   TORCH_CHECK(w.scalar_type() == torch::kInt32 && w.dim() == 2, name, " must be int32 [N, K/8+1]");
-  TORCH_CHECK(w.size(1) == K / 8 + 1, name, " second dim must be K/8+1");
+  TORCH_CHECK(
+      w.size(1) >= K / 8 + 1,
+      name,
+      " second dim must contain K/8 packed words plus a scale");
 }
 
 static QuantizedX quantize_x(torch::Tensor x) {
@@ -216,16 +385,48 @@ static QuantizedX quantize_x(torch::Tensor x) {
   float* sap = qx.sa.data_ptr<float>();
 
   if (K == 16384)
-    quant_rot_rb<16384, 64><<<static_cast<int>(qx.M), TPB, 0, stream>>>(xp, qp, sap, static_cast<int>(qx.M), K);
+    quant_rot_rb<16384, 64><<<static_cast<int>(qx.M), QUANT_TPB, 0, stream>>>(xp, qp, sap, static_cast<int>(qx.M), K);
   else if (K == 2048)
-    quant_rot_rb<2048, 8><<<static_cast<int>(qx.M), TPB, 0, stream>>>(xp, qp, sap, static_cast<int>(qx.M), K);
+    quant_rot_rb<2048, 8><<<static_cast<int>(qx.M), QUANT_TPB, 0, stream>>>(xp, qp, sap, static_cast<int>(qx.M), K);
   else if (K == 1024)
-    quant_rot_rb<1024, 4><<<static_cast<int>(qx.M), TPB, 0, stream>>>(xp, qp, sap, static_cast<int>(qx.M), K);
+    quant_rot_rb<1024, 4><<<static_cast<int>(qx.M), QUANT_TPB, 0, stream>>>(xp, qp, sap, static_cast<int>(qx.M), K);
   else
-    quant_rows<<<static_cast<int>(qx.M), TPB, 0, stream>>>(xp, qp, sap, static_cast<int>(qx.M), K);
+    quant_rows<<<static_cast<int>(qx.M), QUANT_TPB, 0, stream>>>(xp, qp, sap, static_cast<int>(qx.M), K);
 
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return qx;
+}
+
+static void launch_gate_up_gemm(
+    const QuantizedX& qx, torch::Tensor w, torch::Tensor y, int N, hipStream_t stream) {
+  constexpr int MAIN_M = 256;
+  const int M = static_cast<int>(qx.M);
+  const int main_rows = (M / MAIN_M) * MAIN_M;
+  const int tail_rows = M - main_rows;
+  const int* a = qx.q.data_ptr<int>();
+  const int* b = w.data_ptr<int>();
+  _Float16* out = reinterpret_cast<_Float16*>(y.data_ptr<at::Half>());
+  const float* scales = qx.sa.data_ptr<float>();
+  const int row = static_cast<int>(w.size(1));
+
+  if (main_rows > 0) {
+    dim3 grid((N + 127) / 128, main_rows / MAIN_M);
+    gemm_iu4_shape<256, 128, 128, 512, 2, 4, true><<<grid, 512, 0, stream>>>(
+        a, b, out, scales, main_rows, N, qx.K, row);
+  }
+  if (tail_rows > 0 && tail_rows <= 16) {
+    dim3 grid((N + 511) / 512, 1);
+    const long a_offset = (long)main_rows * (qx.K / 8);
+    const long y_offset = (long)main_rows * N;
+    gemm_iu4_shape<16, 512, BK, 256, 1, 4><<<grid, 256, 0, stream>>>(
+        a + a_offset, b, out + y_offset, scales + main_rows, tail_rows, N, qx.K, row);
+  } else if (tail_rows > 0) {
+    dim3 grid((N + BN - 1) / BN, 1);
+    const long a_offset = (long)main_rows * (qx.K / 8);
+    const long y_offset = (long)main_rows * N;
+    gemm_iu4<BK><<<grid, GEMM_TPB, 0, stream>>>(
+        a + a_offset, b, out + y_offset, scales + main_rows, tail_rows, N, qx.K, row);
+  }
 }
 
 static torch::Tensor gemm_from_q(const QuantizedX& qx, torch::Tensor w) {
@@ -236,15 +437,34 @@ static torch::Tensor gemm_from_q(const QuantizedX& qx, torch::Tensor w) {
 
   const c10::cuda::CUDAGuard guard(qx.x2.device());
   hipStream_t stream = at::cuda::getCurrentCUDAStream();
+  const int row = static_cast<int>(w.size(1));
   dim3 grid((N + BN - 1) / BN, (static_cast<int>(qx.M) + BM - 1) / BM);
-  gemm_iu4<<<grid, TPB, 0, stream>>>(
-      qx.q.data_ptr<int>(),
-      w.data_ptr<int>(),
-      reinterpret_cast<_Float16*>(y.data_ptr<at::Half>()),
-      qx.sa.data_ptr<float>(),
-      static_cast<int>(qx.M),
-      N,
-      qx.K);
+#if GATE_SPECIAL
+  if (qx.K == 2048 && N == 16384) {
+    launch_gate_up_gemm(qx, w, y, N, stream);
+  } else
+#endif
+  if (qx.K == 16384) {
+    gemm_iu4<DOWN_BK, true><<<grid, GEMM_TPB, 0, stream>>>(
+        qx.q.data_ptr<int>(),
+        w.data_ptr<int>(),
+        reinterpret_cast<_Float16*>(y.data_ptr<at::Half>()),
+        qx.sa.data_ptr<float>(),
+        static_cast<int>(qx.M),
+        N,
+        qx.K,
+        row);
+  } else {
+    gemm_iu4<BK><<<grid, GEMM_TPB, 0, stream>>>(
+        qx.q.data_ptr<int>(),
+        w.data_ptr<int>(),
+        reinterpret_cast<_Float16*>(y.data_ptr<at::Half>()),
+        qx.sa.data_ptr<float>(),
+        static_cast<int>(qx.M),
+        N,
+        qx.K,
+        row);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   auto yshape = qx.x2.sizes().vec();

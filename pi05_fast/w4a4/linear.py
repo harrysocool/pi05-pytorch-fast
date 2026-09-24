@@ -10,12 +10,20 @@ from pi05_fast.w4a4.pack import pack_linear_weight, should_rotate
 class W4A4Linear(nn.Module):
     """Drop-in Linear: runtime INT4 activations + packed INT4 weights."""
 
-    def __init__(self, packed: torch.Tensor, bias: torch.Tensor | None = None, rotate: bool | None = None):
+    def __init__(
+        self,
+        packed: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        rotate: bool | None = None,
+        in_features: int | None = None,
+    ):
         super().__init__()
         if packed.dim() != 2:
             raise ValueError("packed weight must be [N, K/8+1]")
         self.out_features = packed.shape[0]
-        self.in_features = (packed.shape[1] - 1) * 8
+        self.in_features = in_features or (packed.shape[1] - 1) * 8
+        if packed.shape[1] < self.in_features // 8 + 1:
+            raise ValueError("packed weight row is too short for in_features")
         self.rotate = should_rotate(self.in_features, rotate)
         self.register_buffer("packed", packed.to(torch.int32), persistent=True)
         # LeRobot reads ``proj.weight.dtype``; keep a dtype marker, not real weights.
@@ -33,7 +41,7 @@ class W4A4Linear(nn.Module):
     def from_linear(cls, linear: nn.Linear, rotate: bool | None = None) -> W4A4Linear:
         packed = pack_linear_weight(linear.weight, rotate=rotate)
         bias = linear.bias.detach() if linear.bias is not None else None
-        return cls(packed, bias=bias, rotate=rotate)
+        return cls(packed, bias=bias, rotate=rotate, in_features=linear.in_features)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         xf = x if x.dtype == torch.float16 else x.to(dtype=torch.float16)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 from pathlib import Path
 
 import torch
@@ -59,6 +60,10 @@ def load_int4_gemm():
             break
     if (rocm_root / "include" / "thrust").is_dir():
         cuda_cflags.append(f"-isystem{rocm_root / 'include'}")
+    extra_cuda_cflags = shlex.split(os.environ.get("PI05_W4A4_EXTRA_CFLAGS", ""))
+    if extra_cuda_cflags:
+        cuda_cflags.extend(extra_cuda_cflags)
+        print(f"w4a4: extra HIP flags: {' '.join(extra_cuda_cflags)}", flush=True)
     _mod = load(
         name="pi05_fast_w4a4_int4",
         sources=[str(csrc / "int4_gemm.cu")],
