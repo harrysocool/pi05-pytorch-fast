@@ -80,7 +80,7 @@ def _register_custom_op() -> None:
     if _op_registered:
         return
     try:
-        torch.ops.pi05_w4a4.int4_gemm3
+        torch.ops.pi05_w4a4.int4_gemm2_tiled
         _op_registered = True
         return
     except (AttributeError, RuntimeError):
@@ -97,6 +97,14 @@ def _register_custom_op() -> None:
     def _int4_gemm_fake(x: torch.Tensor, packed: torch.Tensor) -> torch.Tensor:
         return _fake_out(x, packed)
 
+    @torch.library.custom_op("pi05_w4a4::int4_gemm_tiled", mutates_args=())
+    def _int4_gemm_tiled(x: torch.Tensor, packed: torch.Tensor) -> torch.Tensor:
+        return load_int4_gemm().int4_gemm_tiled(x, packed)
+
+    @_int4_gemm_tiled.register_fake
+    def _int4_gemm_tiled_fake(x: torch.Tensor, packed: torch.Tensor) -> torch.Tensor:
+        return _fake_out(x, packed)
+
     @torch.library.custom_op("pi05_w4a4::int4_gemm2", mutates_args=())
     def _int4_gemm2(
         x: torch.Tensor, w0: torch.Tensor, w1: torch.Tensor
@@ -105,6 +113,16 @@ def _register_custom_op() -> None:
 
     @_int4_gemm2.register_fake
     def _int4_gemm2_fake(x: torch.Tensor, w0: torch.Tensor, w1: torch.Tensor):
+        return _fake_out(x, w0), _fake_out(x, w1)
+
+    @torch.library.custom_op("pi05_w4a4::int4_gemm2_tiled", mutates_args=())
+    def _int4_gemm2_tiled(
+        x: torch.Tensor, w0: torch.Tensor, w1: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return load_int4_gemm().int4_gemm2_tiled(x, w0, w1)
+
+    @_int4_gemm2_tiled.register_fake
+    def _int4_gemm2_tiled_fake(x: torch.Tensor, w0: torch.Tensor, w1: torch.Tensor):
         return _fake_out(x, w0), _fake_out(x, w1)
 
     @torch.library.custom_op("pi05_w4a4::int4_gemm3", mutates_args=())
@@ -130,10 +148,22 @@ def int4_gemm(x: torch.Tensor, packed_w: torch.Tensor) -> torch.Tensor:
     return torch.ops.pi05_w4a4.int4_gemm(x, packed_w)
 
 
+def int4_gemm_tiled(x: torch.Tensor, packed_w: torch.Tensor) -> torch.Tensor:
+    """INT4 GEMM with weights stored in WMMA-fragment-major order."""
+    return torch.ops.pi05_w4a4.int4_gemm_tiled(x, packed_w)
+
+
 def int4_gemm2(
     x: torch.Tensor, w0: torch.Tensor, w1: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.ops.pi05_w4a4.int4_gemm2(x, w0, w1)
+
+
+def int4_gemm2_tiled(
+    x: torch.Tensor, w0: torch.Tensor, w1: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Shared activation quant plus two preshuffled INT4 GEMMs."""
+    return torch.ops.pi05_w4a4.int4_gemm2_tiled(x, w0, w1)
 
 
 def int4_gemm3(

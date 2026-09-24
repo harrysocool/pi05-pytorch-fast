@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from pi05_fast.w4a4.extension import int4_gemm
+from pi05_fast.w4a4.extension import int4_gemm, int4_gemm_tiled
 from pi05_fast.w4a4.pack import pack_linear_weight, should_rotate
 
 
@@ -16,6 +16,7 @@ class W4A4Linear(nn.Module):
         bias: torch.Tensor | None = None,
         rotate: bool | None = None,
         in_features: int | None = None,
+        preshuffled: bool = False,
     ):
         super().__init__()
         if packed.dim() != 2:
@@ -25,6 +26,9 @@ class W4A4Linear(nn.Module):
         if packed.shape[1] < self.in_features // 8 + 1:
             raise ValueError("packed weight row is too short for in_features")
         self.rotate = should_rotate(self.in_features, rotate)
+        self.preshuffled = preshuffled
+        if self.preshuffled and packed.shape[1] != self.in_features // 8 + 9:
+            raise ValueError("preshuffled weight must use the K/8+9 marker stride")
         self.register_buffer("packed", packed.to(torch.int32), persistent=True)
         # LeRobot reads ``proj.weight.dtype``; keep a dtype marker, not real weights.
         self.register_buffer(
@@ -47,7 +51,7 @@ class W4A4Linear(nn.Module):
         xf = x if x.dtype == torch.float16 else x.to(dtype=torch.float16)
         if not xf.is_contiguous():
             xf = xf.contiguous()
-        y = int4_gemm(xf, self.packed)
+        y = int4_gemm_tiled(xf, self.packed) if self.preshuffled else int4_gemm(xf, self.packed)
         if y.dtype != x.dtype:
             y = y.to(dtype=x.dtype)
         if self.bias is not None:
@@ -55,4 +59,7 @@ class W4A4Linear(nn.Module):
         return y
 
     def extra_repr(self) -> str:
-        return f"in={self.in_features}, out={self.out_features}, rotate={self.rotate}"
+        return (
+            f"in={self.in_features}, out={self.out_features}, "
+            f"rotate={self.rotate}, preshuffled={self.preshuffled}"
+        )

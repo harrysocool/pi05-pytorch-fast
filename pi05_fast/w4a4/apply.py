@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 
 from pi05_fast.w4a4.linear import W4A4Linear
-from pi05_fast.w4a4.pack import should_rotate
+from pi05_fast.w4a4.pack import preshuffle_wmma_weight, should_rotate
 
 # Prefix language-model GEMMs only (SigLIP / expert / embeddings stay fp).
 DEFAULT_NAME_PREFIXES = (
@@ -49,6 +49,7 @@ def replace_linears_from_packed(
     device: torch.device | None = None,
 ) -> int:
     row_pad_words = max(1, int(os.environ.get("PI05_W4A4_ROW_PAD_WORDS", "8")))
+    gate_preshuffle = os.environ.get("PI05_W4A4_GATE_PRESHUFFLE", "1") != "0"
     n = 0
     for name, spec in meta_layers.items():
         key = f"{name}.packed"
@@ -56,7 +57,15 @@ def replace_linears_from_packed(
             continue
         w = packed[key]
         logical_words = int(spec["in_features"]) // 8
-        if row_pad_words > 1 and w.shape[1] == logical_words + 1:
+        preshuffled = (
+            gate_preshuffle
+            and name.endswith((".mlp.gate_proj", ".mlp.up_proj"))
+            and int(spec["in_features"]) == 2048
+            and int(spec["out_features"]) == 16384
+        )
+        if preshuffled:
+            w = preshuffle_wmma_weight(w, int(spec["in_features"]))
+        elif row_pad_words > 1 and w.shape[1] == logical_words + 1:
             w = torch.nn.functional.pad(w, (0, row_pad_words - 1))
         if device is not None:
             w = w.to(device)
@@ -72,6 +81,7 @@ def replace_linears_from_packed(
                 bias=bias,
                 rotate=rotate,
                 in_features=int(spec["in_features"]),
+                preshuffled=preshuffled,
             ),
         )
         n += 1
@@ -94,11 +104,15 @@ def apply_w4a4_from_dir(model: nn.Module, pack_dir: str | Path) -> int:
     preload()
     n = replace_linears_from_packed(model, packed, meta["layers"], device=device)
     n_fuse = fuse_shared_activation_quant(model)
+    n_preshuffled = sum(
+        isinstance(module, W4A4Linear) and module.preshuffled for module in model.modules()
+    )
     row_pad_words = max(1, int(os.environ.get("PI05_W4A4_ROW_PAD_WORDS", "8")))
     print(
         f"w4a4: replaced {n} Linear modules from {pack_dir}; "
         f"shared-quant fused {n_fuse} QKV/MLP groups; "
-        f"row stride pad {row_pad_words} word(s)",
+        f"row stride pad {row_pad_words} word(s); "
+        f"WMMA-preshuffled gate/up {n_preshuffled}",
         flush=True,
     )
     return n
@@ -110,10 +124,17 @@ def _as_fp16_contig(x: torch.Tensor) -> torch.Tensor:
 
 
 def _fused_mlp_forward(self, x: torch.Tensor) -> torch.Tensor:
-    from pi05_fast.w4a4.extension import int4_gemm, int4_gemm2
+    from pi05_fast.w4a4.extension import (
+        int4_gemm,
+        int4_gemm2,
+        int4_gemm2_tiled,
+    )
 
     xf = _as_fp16_contig(x)
-    gate, up = int4_gemm2(xf, self.gate_proj.packed, self.up_proj.packed)
+    if self.gate_proj.preshuffled and self.up_proj.preshuffled:
+        gate, up = int4_gemm2_tiled(xf, self.gate_proj.packed, self.up_proj.packed)
+    else:
+        gate, up = int4_gemm2(xf, self.gate_proj.packed, self.up_proj.packed)
     h = self.act_fn(gate) * up
     if not h.is_contiguous():
         h = h.contiguous()

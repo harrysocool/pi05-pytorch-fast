@@ -12,6 +12,7 @@ from typing import Any
 import torch
 
 ROTATE_K = frozenset({1024, 2048, 16384})
+WMMA_PRESHUFFLE_PAD_WORDS = 9
 
 
 def fwht_unnormalized(x: torch.Tensor) -> torch.Tensor:
@@ -39,6 +40,32 @@ def pack_nibbles(q: torch.Tensor) -> torch.Tensor:
     for j in range(8):
         packed = packed | ((q[..., j] & 0xF) << (j * 4))
     return packed
+
+
+def preshuffle_wmma_weight(packed: torch.Tensor, k: int) -> torch.Tensor:
+    """Reorder packed weights as [K/16, N, 2 words] for coalesced WMMA loads.
+
+    The per-channel scales follow the packed payload in one contiguous block.
+    An otherwise-unused ninth padding word distinguishes this internal layout
+    from the ordinary row-major ``K/8 + 8`` representation.
+    """
+    if packed.dim() != 2:
+        raise ValueError(f"expected 2D packed weight, got {tuple(packed.shape)}")
+    n = packed.shape[0]
+    words = k // 8
+    if k % 16 != 0 or packed.shape[1] < words + 1:
+        raise ValueError(f"invalid packed weight shape {tuple(packed.shape)} for K={k}")
+
+    out = torch.zeros(
+        (n, words + WMMA_PRESHUFFLE_PAD_WORDS),
+        dtype=packed.dtype,
+        device=packed.device,
+    )
+    payload = packed[:, :words].view(n, words // 2, 2).permute(1, 0, 2).contiguous()
+    flat = out.view(-1)
+    flat[: n * words].copy_(payload.view(-1))
+    flat[n * words : n * words + n].copy_(packed[:, words])
+    return out
 
 
 def unpack_nibbles(packed: torch.Tensor, k: int) -> torch.Tensor:
