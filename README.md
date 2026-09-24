@@ -6,10 +6,10 @@ Machine: AMD Ryzen AI Max+ / Radeon 8060S (`gfx1151`).
 
 | Metric | Value |
 |--------|--------|
-| E2E action chunk latency | **96.00 ms** default, **79.88 ms** with `PI05_LANG_TOKENS=64 PI05_CACHE_EMPTY_CAM=1` (100-run median; `scripts/bench_latency.py`) |
-| LIBERO-10 accuracy | **20/20 = 100%** on the default maintained path (2 episodes × 10 tasks, seed 0) |
+| E2E action chunk latency | **95.03 ms** default; **91.50 ms** at 192 language tokens; **81.99 ms** at 64 tokens; **74.48 ms** at 64 tokens + empty-camera cache (100-run medians) |
+| LIBERO-10 accuracy | Default: **20/20**. The 192-token mode produced **19/20** and **18/20** in two repeated seed-0 smoke runs |
 | `n_action_steps` / `num_inference_steps` | 10 / 1 |
-| Prefix tokens | 776 (batched SigLIP + empty-camera pool 256→64); **640** with `PI05_LANG_TOKENS=64` |
+| Prefix tokens | 776 by default; **768** with `PI05_LANG_TOKENS=192`; **640** with `PI05_LANG_TOKENS=64` |
 
 Two episodes per task is a **smoke** for quantization/compile correctness, not a full 500-episode LIBERO score.
 
@@ -35,10 +35,11 @@ Closed-loop **LeRobot PI05Policy** inference:
 3. Prefix LM weights/activations in **fp16** (match W4A4; SigLIP stays bf16)
 4. Shared activation quant for QKV and gate/up (`int4_gemm3` / `int4_gemm2`)
 5. WMMA-fragment-major gate/up weights for coalesced static-weight loads
-6. Batched SigLIP (3 cameras in one forward); empty-camera pool **256→64** → prefix **776**
-7. **`torch.compile(max-autotune-no-cudagraphs, fullgraph=True)`** + gfx1151 L2 antialias
-8. LM / expert attention **eager** (Inductor); SigLIP **SDPA**
-9. `n_action_steps=10`, `num_inference_steps=1`
+6. Cached row/column dequant scales in the WMMA epilogue; bounds-free full gate tiles
+7. Batched SigLIP (3 cameras in one forward); empty-camera pool **256→64** → prefix **776**
+8. **`torch.compile(max-autotune-no-cudagraphs, fullgraph=True)`** + gfx1151 L2 antialias
+9. LM / expert attention **eager** (Inductor); SigLIP **SDPA**
+10. `n_action_steps=10`, `num_inference_steps=1`
 
 **pure PyTorch** path we have on this GPU.
 
@@ -111,6 +112,7 @@ python scripts/libero_eval.py \
   --output-dir eval_out/libero10_ep2
 
 # optional prefix trimming; evaluate separately for the target task set
+PI05_LANG_TOKENS=192 python scripts/libero_eval.py ... --output-dir eval_out/libero10_lang192
 PI05_LANG_TOKENS=64 python scripts/libero_eval.py ... --output-dir eval_out/libero10_lang64
 ```
 
@@ -127,14 +129,15 @@ When using `PI05_LANG_TOKENS`, check the log says `lang tokens trimmed to 64` an
 ```bash
 source env.sh
 
-python scripts/bench_latency.py                        # 96 ms
-PI05_LANG_TOKENS=64 python scripts/bench_latency.py    # task-dependent intermediate
+python scripts/bench_latency.py                        # ~95 ms
+PI05_LANG_TOKENS=192 python scripts/bench_latency.py   # 91.50 ms
+PI05_LANG_TOKENS=64 python scripts/bench_latency.py    # 81.99 ms
 PI05_LANG_TOKENS=64 PI05_CACHE_EMPTY_CAM=1 \
-    python scripts/bench_latency.py                    # 80 ms
+    python scripts/bench_latency.py                    # 74.48 ms
 ```
 
 First call pays `torch.compile` autotune (minutes). Median after warmup is the number
-to compare (**96.00 ms** on 8060S, **79.88 ms** with both knobs).
+to compare (**95.03 ms** on 8060S, **74.48 ms** with both knobs).
 
 The synthetic prompt fills 52 of the 200 padded language tokens, matching LIBERO-10
 (`PI05_BENCH_LANG_LEN` overrides it).
@@ -179,7 +182,7 @@ pi05-pytorch-fast/
 | `PI05_W4A4_GATE_PRESHUFFLE` | `1` | Reorder the static 2048→16384 gate/up weights once at load time into WMMA-fragment-major order. Set `0` for the row-major fallback |
 | `PYTORCH_HIP_ALLOC_CONF` | `max_split_size_mb:512` | Stable allocator setting on this gfx1151 APU. `expandable_segments:True` can hang the first allocation with the pinned nightly stack |
 | `PI05_INDUCTOR_GEMM_BACKENDS` | `ATEN` | Inductor GEMM backend. ROCm 10.1 disables the origami heuristic, so Inductor mis-ranks triton over hipBLASLt; `ATEN` is ~2% faster. Set empty to restore triton autotune |
-| `PI05_LANG_TOKENS` | unset (off) | Trim trailing **padded** language tokens to this bucket (prefix = 576 + N). Real tokens are never dropped: if the prompt does not fit, the full 200 are used and a warning is printed. `64` → prefix 640 = exactly 5 `gemm_iu4` `BM=128` tiles (−14% E2E, LIBERO-10 still 20/20) |
+| `PI05_LANG_TOKENS` | unset (off) | Trim trailing **padded** language tokens to this bucket (prefix = 576 + N). Real tokens are never dropped: if the prompt does not fit, the full 200 are used and a warning is printed. This changes the compiled sequence shape and is not action-equivalent, so trimmed modes remain opt-in. |
 | `PI05_CACHE_EMPTY_CAM` | `0` (off) | Cache the empty-camera SigLIP embedding. With `empty_cameras=1` the placeholder camera is a constant `-1` image, so its embedding never changes, yet a full vision forward runs on it every frame. Caching it batches only the real cameras (−7 ms). Not bit-exact: bf16 SigLIP output depends on batch size (rel err ~4e-3) |
 | `SNAPFLOW_TEACHER_POLICY` | `~/model_data/pi05_libero_v044` | Processor json/safetensors |
 | `PALIGEMMA_TOKENIZER_PATH` | `~/model_data/paligemma2-3b-pt-224` | Local tokenizer |
@@ -195,12 +198,18 @@ pi05-pytorch-fast/
 - Fusing GELU × gate/up into down-projection quantization (slower and not bit-exact)
 - XOR-swizzled LDS and later vector/tail specializations whose sub-millisecond gains did
   not justify the extra shape-specific production code
+- Making `PI05_LANG_TOKENS=192` the default: it measured 91.50 ms, but two
+  repeated seed-0 LIBERO-10 smoke runs were 19/20 and 18/20 versus 20/20 on the
+  maintained 200-token path. The failed episodes changed between runs, so this
+  is a robustness warning rather than evidence of one deterministic task failure
 - ROCm expandable allocator segments with the pinned nightly stack (first allocation can hang)
 - ONNX / MIGraphX / ORT (parent `pi05-migraphx` package)
 
 ## License / provenance
 
 - W4A4 kernel layout (Hadamard on selected K).
+- WMMA epilogue scale caching/full-tile pattern adapted from
+  [Comfy-Kitchen PR #174](https://github.com/Comfy-Org/comfy-kitchen/pull/174).
 - SnapFlow eval class adapted from Reflex VLA (Apache-2.0).
 - Antialias pass from AMD rocm-scripts gfx1151 tests.
 - Policy weights: Hugging Face (see `download_checkpoints.sh`).

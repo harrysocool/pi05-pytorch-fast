@@ -176,23 +176,36 @@ __global__ void gemm_iu4(
       buf ^= 1;
     }
   }
-  for (int mi = 0; mi < MI; mi++)
-    for (int ni = 0; ni < NI; ni++) {
-      int r0 = wm * 32 + mi * 16, c0 = wn * 64 + ni * 16;
-      int col = bn + c0 + lane;
-      if (col >= N) continue;
-      float scw = __int_as_float(B[weight_scale_offset<TILED_B>(col, N, K, ROW)]);
-      for (int e = 0; e < 8; e++) {
-        int r = 2 * e + lid / 16;
-        int gr = bm + r0 + r;
-        if (gr < M) Cf[gr * N + col] = (_Float16)((float)c[mi][ni][e] * sa[gr] * scw);
+  // Reuse each output-column scale across both M fragments, and each row
+  // scale across all N fragments owned by this lane.
+  float col_scale[NI];
+  for (int ni = 0; ni < NI; ni++) {
+    int c0 = wn * 64 + ni * 16;
+    int col = bn + c0 + lane;
+    if (col < N)
+      col_scale[ni] = __int_as_float(B[weight_scale_offset<TILED_B>(col, N, K, ROW)]);
+  }
+  for (int mi = 0; mi < MI; mi++) {
+    int r0 = wm * 32 + mi * 16;
+    for (int e = 0; e < 8; e++) {
+      int r = 2 * e + lid / 16;
+      int gr = bm + r0 + r;
+      if (gr >= M) continue;
+      float row_scale = sa[gr];
+      for (int ni = 0; ni < NI; ni++) {
+        int c0 = wn * 64 + ni * 16;
+        int col = bn + c0 + lane;
+        if (col < N)
+          Cf[gr * N + col] = (_Float16)(
+              (float)c[mi][ni][e] * row_scale * col_scale[ni]);
       }
     }
+  }
 }
 
 // Shape-specialized companion used only by the M=776 gate/up projections.
 template <int TILE_M, int TILE_N, int TILE_K, int THREADS, int M_ITERS, int N_ITERS,
-          bool SINGLE_BUFFER = false, bool TILED_B = false>
+          bool SINGLE_BUFFER = false, bool TILED_B = false, bool FULL_TILE = false>
 __global__ void gemm_iu4_shape(
     const int* A,
     const int* B,
@@ -219,6 +232,12 @@ __global__ void gemm_iu4_shape(
   __shared__ int As[SINGLE_BUFFER ? 1 : 2][TILE_M * LDAi];
   __shared__ int Bs[SINGLE_BUFFER ? 1 : 2][TILE_N * LDAi];
   int bm = blockIdx.y * TILE_M, bn = blockIdx.x * TILE_N, tid = threadIdx.x;
+  if constexpr (FULL_TILE) {
+    // This specialization is launched only for the full gate/up body. Keeping
+    // its fixed dimensions visible lets clang fold the address arithmetic.
+    __builtin_assume(K == 2048);
+    __builtin_assume(N == 16384);
+  }
   int wid = tid / 32, lid = tid % 32, lane = lid % 16;
   int wm = wid / N_WAVES, wn = wid % N_WAVES;
   int8v c[M_ITERS][N_ITERS];
@@ -230,7 +249,10 @@ __global__ void gemm_iu4_shape(
     if (x >= A_WORDS) continue;
     int r = x / KPW, kk = x % KPW;
     int gr = bm + r;
-    As[0][r * LDAi + kk] = (gr < M) ? A[gr * (K / 8) + kk] : 0;
+    if constexpr (FULL_TILE)
+      As[0][r * LDAi + kk] = A[gr * (K / 8) + kk];
+    else
+      As[0][r * LDAi + kk] = (gr < M) ? A[gr * (K / 8) + kk] : 0;
   }
   for (int i = 0; i < NLB; i++) {
     int x = tid + i * THREADS;
@@ -245,8 +267,11 @@ __global__ void gemm_iu4_shape(
       kk = x % KPW;
     }
     int gc = bn + co;
-    Bs[0][co * LDAi + kk] =
-        (gc < N) ? B[weight_word_offset<TILED_B>(gc, kk, N, K, ROW)] : 0;
+    if constexpr (FULL_TILE)
+      Bs[0][co * LDAi + kk] = B[weight_word_offset<TILED_B>(gc, kk, N, K, ROW)];
+    else
+      Bs[0][co * LDAi + kk] =
+          (gc < N) ? B[weight_word_offset<TILED_B>(gc, kk, N, K, ROW)] : 0;
   }
   __syncthreads();
 
@@ -263,7 +288,10 @@ __global__ void gemm_iu4_shape(
         }
         int r = x / KPW, kk = x % KPW;
         int gr = bm + r;
-        ra[i] = (gr < M) ? A[gr * (K / 8) + (nk / 8 + kk)] : 0;
+        if constexpr (FULL_TILE)
+          ra[i] = A[gr * (K / 8) + (nk / 8 + kk)];
+        else
+          ra[i] = (gr < M) ? A[gr * (K / 8) + (nk / 8 + kk)] : 0;
       }
       for (int i = 0; i < NLB; i++) {
         int x = tid + i * THREADS;
@@ -281,9 +309,12 @@ __global__ void gemm_iu4_shape(
           kk = x % KPW;
         }
         int gc = bn + co;
-        rb[i] = (gc < N)
-            ? B[weight_word_offset<TILED_B>(gc, nk / 8 + kk, N, K, ROW)]
-            : 0;
+        if constexpr (FULL_TILE)
+          rb[i] = B[weight_word_offset<TILED_B>(gc, nk / 8 + kk, N, K, ROW)];
+        else
+          rb[i] = (gc < N)
+              ? B[weight_word_offset<TILED_B>(gc, nk / 8 + kk, N, K, ROW)]
+              : 0;
       }
     }
     for (int ks = 0; ks < TILE_K; ks += 16)
@@ -328,19 +359,38 @@ __global__ void gemm_iu4_shape(
     }
   }
 
-  for (int mi = 0; mi < M_ITERS; mi++)
-    for (int ni = 0; ni < N_ITERS; ni++) {
-      int r0 = wm * (M_ITERS * 16) + mi * 16;
-      int c0 = wn * (N_ITERS * 16) + ni * 16;
-      int col = bn + c0 + lane;
-      if (col >= N) continue;
-      float scw = __int_as_float(B[weight_scale_offset<TILED_B>(col, N, K, ROW)]);
-      for (int e = 0; e < 8; e++) {
-        int r = 2 * e + lid / 16;
-        int gr = bm + r0 + r;
-        if (gr < M) Cf[gr * N + col] = (_Float16)((float)c[mi][ni][e] * sa[gr] * scw);
+  // The main gate/up tile is interior in both dimensions. Cache scales once
+  // per row/column instead of reloading them for every accumulator element.
+  float col_scale[N_ITERS];
+  for (int ni = 0; ni < N_ITERS; ni++) {
+    int c0 = wn * (N_ITERS * 16) + ni * 16;
+    int col = bn + c0 + lane;
+    if constexpr (FULL_TILE)
+      col_scale[ni] = __int_as_float(B[weight_scale_offset<TILED_B>(col, N, K, ROW)]);
+    else if (col < N)
+      col_scale[ni] = __int_as_float(B[weight_scale_offset<TILED_B>(col, N, K, ROW)]);
+  }
+  for (int mi = 0; mi < M_ITERS; mi++) {
+    int r0 = wm * (M_ITERS * 16) + mi * 16;
+    for (int e = 0; e < 8; e++) {
+      int r = 2 * e + lid / 16;
+      int gr = bm + r0 + r;
+      if constexpr (!FULL_TILE) {
+        if (gr >= M) continue;
+      }
+      float row_scale = sa[gr];
+      for (int ni = 0; ni < N_ITERS; ni++) {
+        int c0 = wn * (N_ITERS * 16) + ni * 16;
+        int col = bn + c0 + lane;
+        if constexpr (FULL_TILE)
+          Cf[gr * N + col] = (_Float16)(
+              (float)c[mi][ni][e] * row_scale * col_scale[ni]);
+        else if (col < N)
+          Cf[gr * N + col] = (_Float16)(
+              (float)c[mi][ni][e] * row_scale * col_scale[ni]);
       }
     }
+  }
 }
 
 template <int K, int R>
@@ -495,7 +545,7 @@ static void launch_gate_up_gemm(
 
   if (main_rows > 0) {
     dim3 grid((N + 127) / 128, main_rows / MAIN_M);
-    gemm_iu4_shape<256, 128, 128, 512, 2, 4, true, TILED_B><<<grid, 512, 0, stream>>>(
+    gemm_iu4_shape<256, 128, 128, 512, 2, 4, true, TILED_B, true><<<grid, 512, 0, stream>>>(
         a, b, out, scales, main_rows, N, qx.K, row);
   }
   if (tail_rows > 0 && tail_rows <= 16) {
